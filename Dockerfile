@@ -12,6 +12,9 @@ COPY . .
 # Important
 ENV PYTHONPATH=/app
 
+# Rendre le script d'entrypoint exécutable
+RUN chmod +x entrypoint.sh
+
 EXPOSE 8020
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8020"]
+ENTRYPOINT ["./entrypoint.sh"]
