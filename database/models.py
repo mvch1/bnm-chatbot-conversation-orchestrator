@@ -139,6 +139,10 @@ class Agent(Base):
     id         = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     name       = Column(String(120), nullable=False)
     email      = Column(String(180), unique=True, nullable=False, index=True)
+
+    # 🔥 NOUVEAU
+    active_tickets_count = Column(Integer, default=0, nullable=False)
+
     is_active  = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_now, nullable=False)
 
@@ -146,8 +150,7 @@ class Agent(Base):
     tickets = relationship("Ticket", back_populates="agent")
 
     def __repr__(self):
-        return f"<Agent name={self.name}>"
-
+        return f"<Agent name={self.name} active_tickets={self.active_tickets_count}>"
 
 # ── Ticket ────────────────────────────────────────────────────────────────────
 

@@ -7,6 +7,8 @@ from database.repository import save_ticket
 from database.db import get_db
 from database.models import Session as DBSession, Message, User
 from sqlalchemy import select
+from core.service import handle_workflow
+
 
 logger = get_logger("conversation-orchestrator")
 
@@ -119,14 +121,6 @@ async def _trigger_workflow(wf_type: str, session: Dict, rag_data: Dict) -> None
     """Call the workflow service to finalise a complaint or wallet validation."""
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            await client.post(
-                f"{settings.workflow_service_url}/workflow/{wf_type}",
-                json={
-                    "session_id": session.get("session_id"),
-                    "phone": session.get("user_phone"),
-                    "collected_data": session.get("collected_data", {}),
-                    "rag_data": rag_data,
-                },
-            )
+            await handle_workflow(wf_type, session, rag_data)
     except Exception as e:
         logger.error(f"Trigger workflow error (type={wf_type}): {e}")
