@@ -1,5 +1,7 @@
 
 import httpx
+import json
+from urllib.parse import urljoin
 from typing import Dict, Any, List
 from config import settings
 from shared.constants.intents import Intent
@@ -19,7 +21,7 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 async def _get_recent_messages(session: Dict[str, Any], limit: int = 5) -> List[Dict[str, str]]:
     """
     Retrieve the last `limit` messages for this session from the DB.
-    Returns a list of {"role": "user"|"bot", "content": str} dicts.
+    Returns a list of {"role": "client"|"assistant", "content": str} dicts.
     """
     session_id = session.get("session_id")
     if not session_id:
@@ -37,14 +39,14 @@ async def _get_recent_messages(session: Dict[str, Any], limit: int = 5) -> List[
     # Reverse to chronological order and map direction to role
     context = []
     for msg in reversed(messages):
-        role = "user" if msg.direction == "inbound" else "bot"
+        role = "client" if msg.direction == "inbound" else "assistant"
         context.append({"role": role, "content": msg.content})
     return context
 
 async def _get_recent_messages_reclamation(session: Dict[str, Any], limit: int = 5) -> List[Dict[str, str]]:
     """
     Retrieve the last `limit` messages *before the most recent one* for this session from the DB.
-    Returns a list of {"role": "user"|"bot", "content": str} dicts.
+    Returns a list of {"role": "client"|"assistant", "content": str} dicts.
     """
     session_id = session.get("session_id")
     if not session_id:
@@ -63,7 +65,7 @@ async def _get_recent_messages_reclamation(session: Dict[str, Any], limit: int =
     # Reverse to chronological order and map direction to role
     context = []
     for msg in reversed(messages):
-        role = "user" if msg.direction == "inbound" else "bot"
+        role = "client" if msg.direction == "inbound" else "assistant"
         context.append({"role": role, "content": msg.content})
     return context
 
@@ -89,13 +91,14 @@ async def _get_user_tickets(session: Dict[str, Any]) -> List[Dict[str, Any]]:
             .order_by(Ticket.created_at.desc())
         )
         tickets = result.scalars().all()
+        logger.info(f"Retrieved {len(tickets)} tickets for user_id={user_id}")
 
         return [
             {
                 "id": t.number,
-                "titre": t.description,
+                "titre": t.description or "Sans titre",
                 "statut": t.status,
-                "date": t.created_at.isoformat()
+                "date": t.created_at.isoformat() if t.created_at else ""
             }
             for t in tickets
         ]
@@ -141,10 +144,14 @@ async def _call_endpoint(
     else:
         context = await _get_recent_messages(session, limit=5)
 
-    # 2. Fetch tickets if it's a reclamation
+    # 2. Fetch tickets if it's a relevant intent
     tickets = []
-    if intent == "RECLAMATION":
+    if intent in ["RECLAMATION", "VALIDATION"]:
         tickets = await _get_user_tickets(session)
+
+    # 3. Build robust URL
+    base_url = settings.rag_service_url.rstrip("/")
+    target_url = f"{base_url}{path}"
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -152,17 +159,19 @@ async def _call_endpoint(
                 "question": user_input,
                 "context": context,
                 "intent": intent,
+                "tickets": tickets,  # Always include the tickets list (even if empty)
             }
-            if tickets:
-                payload["tickets"] = tickets
-
-            resp = await client.post(
-                f"{settings.rag_service_url}{path}",
-                json=payload,
-            )
+            
+            logger.debug(f"Calling endpoint: {target_url} with intent {intent}")
+            
+            resp = await client.post(target_url, json=payload)
+            
+            logger.info(f"Endpoint {path} response status: {resp.status_code}")
             
             if resp.status_code == 200:
                 data = resp.json()
+                logger.debug(f"Endpoint {path} response data: {data}")
+                
                 answer = data.get("answer", "Désolé, je n'ai pas pu obtenir de réponse.")
                 nouveau_ticket = data.get("nouveau_ticket")
                 
@@ -172,9 +181,11 @@ async def _call_endpoint(
                     await _trigger_workflow(wf_type, session, {"summary": nouveau_ticket})
                 
                 return {"message": answer}
+            else:
+                logger.error(f"Endpoint {path} returned error {resp.status_code}: {resp.text}")
                 
     except Exception as e:
-        logger.error(f"Error calling {path}: {e}")
+        logger.error(f"Communication error with {path}: {e}")
         
     return {"message": "Je n'ai pas pu trouver une réponse. Souhaitez-vous parler à un conseiller ?"}
 
