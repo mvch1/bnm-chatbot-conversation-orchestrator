@@ -6,7 +6,7 @@ from shared.constants.intents import Intent
 from shared.utils.logger import get_logger
 from database.repository import save_ticket
 from database.db import get_db
-from database.models import Session as DBSession, Message, User
+from database.models import Session as DBSession, Message, User, Ticket
 from sqlalchemy import select
 from core.service import handle_workflow
 
@@ -68,6 +68,39 @@ async def _get_recent_messages_reclamation(session: Dict[str, Any], limit: int =
     return context
 
 
+async def _get_user_tickets(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fetch all tickets for the user linked to this session."""
+    session_id = session.get("session_id")
+    if not session_id:
+        return []
+
+    async with get_db() as db:
+        # 1. Get user_id from the current session
+        result = await db.execute(select(DBSession.user_id).where(DBSession.id == session_id))
+        user_id = result.scalar_one_or_none()
+        if not user_id:
+            return []
+
+        # 2. Get all tickets for all sessions of this user
+        result = await db.execute(
+            select(Ticket)
+            .join(DBSession, Ticket.session_id == DBSession.id)
+            .where(DBSession.user_id == user_id)
+            .order_by(Ticket.created_at.desc())
+        )
+        tickets = result.scalars().all()
+
+        return [
+            {
+                "id": t.number,
+                "titre": t.description,
+                "statut": t.status,
+                "date": t.created_at.isoformat()
+            }
+            for t in tickets
+        ]
+
+
 async def route_message(
     intent: str,
     user_input: str,
@@ -76,13 +109,13 @@ async def route_message(
     """Route message to correct service based on intent."""
 
     if intent == "INFORMATION":
-        return await _call_rag_service(user_input, session, intent)
+        return await _call_endpoint("/information", user_input, session, intent)
 
     if intent == "RECLAMATION":
-        return await _call_workflow_service("complaint", user_input, session, intent)
+        return await _call_endpoint("/reclamation", user_input, session, intent, wf_type="complaint", use_offset=True)
 
     if intent == "VALIDATION":
-        return await _call_workflow_service("wallet", user_input, session, intent)
+        return await _call_endpoint("/validation", user_input, session, intent, wf_type="wallet", use_offset=True)
 
     return {
         "message": (
@@ -92,57 +125,57 @@ async def route_message(
     }
 
 
-async def _call_rag_service(user_input: str, session: Dict, intent: str) -> Dict:
-    # Build context from the last 10 messages of this session
-    context = await _get_recent_messages(session, limit=5)
+async def _call_endpoint(
+    path: str,
+    user_input: str,
+    session: Dict[str, Any],
+    intent: str,
+    wf_type: str = None,
+    use_offset: bool = False
+) -> Dict[str, Any]:
+    """Generic helper to call RAG/Workflow endpoints at settings.rag_service_url."""
+    
+    # 1. Build context
+    if use_offset:
+        context = await _get_recent_messages_reclamation(session, limit=5)
+    else:
+        context = await _get_recent_messages(session, limit=5)
+
+    # 2. Fetch tickets if it's a reclamation
+    tickets = []
+    if intent == "RECLAMATION":
+        tickets = await _get_user_tickets(session)
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            payload = {
+                "question": user_input,
+                "context": context,
+                "intent": intent,
+            }
+            if tickets:
+                payload["tickets"] = tickets
+
             resp = await client.post(
-                f"{settings.rag_service_url}/rag/getAnswer",
-                json={
-                    "question": user_input,
-                    "context": context,
-                    "intent": intent,
-                },
+                f"{settings.rag_service_url}{path}",
+                json=payload,
             )
+            
             if resp.status_code == 200:
                 data = resp.json()
-                return {"message": data["answer"]}
-    except Exception as e:
-        logger.error(f"RAG service error: {e}")
-    return {"message": "Je n'ai pas pu trouver une réponse. Souhaitez-vous parler à un conseiller ?"}
-
-
-async def _call_workflow_service(wf_type: str, user_input: str, session: Dict, intent: str) -> Dict:
-    # Build context from the last 10 messages of this session
-    context = await _get_recent_messages_reclamation(session, limit=5)
-
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.post(
-                f"{settings.rag_service_url}/rag/postAnswer",
-                json={
-                    "question": user_input,
-                    "context": context,
-                    "intent": intent,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                logger.info(f"LLM open_conversation {data.get('create_ticket')    }")
-
-                # If the conversation is still open (collecting data), just return the answer
-                if data.get("create_ticket", True):
-                    await _trigger_workflow(wf_type, session, data)
-                    return {"message": data["answer"]}
-                    
-                # Conversation is complete — trigger the appropriate workflow to create a ticket
+                answer = data.get("answer", "Désolé, je n'ai pas pu obtenir de réponse.")
+                nouveau_ticket = data.get("nouveau_ticket")
                 
-                return {"message": data["answer"]}
-
+                # Check if we should trigger a workflow to create a ticket
+                if nouveau_ticket and wf_type:
+                    logger.info(f"Triggering workflow {wf_type} for session {session.get('session_id')}")
+                    await _trigger_workflow(wf_type, session, {"summary": nouveau_ticket})
+                
+                return {"message": answer}
+                
     except Exception as e:
-        logger.error(f"Workflow service error: {e}")
+        logger.error(f"Error calling {path}: {e}")
+        
     return {"message": "Je n'ai pas pu trouver une réponse. Souhaitez-vous parler à un conseiller ?"}
 
 
