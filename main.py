@@ -182,7 +182,7 @@ async def _process(payload: dict):
 async def _safe(coro):
 
 
-    
+
     """Run a DB coroutine without letting errors break the main flow."""
     try:
         return await coro
@@ -190,31 +190,35 @@ async def _safe(coro):
         logger.error(f"DB persistence error: {exc}")
         return None
 
-async def _get_intent(text: str, session_id: str) -> dict:
+
+async def _get_intent(text: str, session_id: str = None) -> dict:
     try:
-        # Récupérer le contexte
         contexte = None
         if session_id:
-            # Pour l'instant, désactiver contexte pour tester
-            # contexte = await _get_recent_messages(session_id)
-            pass
-        
-        # Construire le payload
+            from core.message_router import _get_recent_messages
+            messages = await _get_recent_messages({"session_id": session_id}, limit=5)
+            if messages and isinstance(messages, list) and len(messages) > 0:
+                contexte = messages
+                print(f"Contexte récupéré pour session {session_id}: {contexte}")
+
         payload = {"question": text}
         if contexte:
             payload["contexte"] = contexte
-        
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
                 f"{settings.intent_service_url}/rag/getIntent",
                 json=payload,
             )
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+                logger.warning(f"Intent service returned unexpected format: {data}")
             else:
                 logger.warning(f"Intent service returned {r.status_code}")
-                
+
     except Exception as e:
         logger.error(f"Intent service error: {e}")
-    
+
     return {"intent": "UNKNOWN"}

@@ -166,7 +166,7 @@ async def _call_endpoint(
             logger.debug(f"Calling endpoint: {target_url} with intent {intent}")
             
             resp = await client.post(target_url, json=payload)
-            
+            print(tickets)       
             logger.info(f"Endpoint {path} response status: {resp.status_code}")
             
             if resp.status_code == 200:
