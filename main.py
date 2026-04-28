@@ -1,5 +1,9 @@
 import uuid
 import httpx
+
+import hmac
+import hashlib
+
 from typing import Optional
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -24,6 +28,10 @@ _wa: Optional[WhatsAppHandler] = None
 
 
 from contextlib import asynccontextmanager
+VERIFY_TOKEN="testtoken123"
+WHATSAPP_TOKEN="EAAUz384Y1HQBRfZCFD8DfaNS82ishtLZATYcj9LZBTFccyE6q3fwDZC66ZB8xTUnFDYRVVxwqQ1LYJ3hgEBfLwaPslkNlE3BrOHsp7hJWBu9aTaCbHdQYOOwv7G9aUDh2o4FNd5jp67zKgH3WfwC5KZAwXEa6zYjeUZAuOgFYVteiIfLtZCDGIY8LupTe2PVnq31ENI1TQJwa1yN8x5aZAMOZAX5zDo79UPW2ahM5cz2lic7jJGGDOvwl8GOXtzxJ0ZC0vdHLYl2vc82jTGFeD5KvsW"
+PHONE_ID       = "1016247598244059"
+BASE_URL       = "https://graph.facebook.com/v18.0"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,19 +57,16 @@ async def health():
 # ── Webhook verification (GET) ────────────────────────────
 @app.get("/webhook")
 async def verify_webhook(request: Request):
-    """Meta webhook verification — répond au challenge."""
+
     params = request.query_params
-    mode      = params.get("hub.mode", "")
-    token     = params.get("hub.verify_token", "")
-    challenge = params.get("hub.challenge", "")
 
-    if mode == "subscribe" and token == settings.whatsapp_verify_token:
-        logger.info("Webhook verified successfully")
-        return PlainTextResponse(challenge)
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY_TOKEN
+    ):
+        return int(params.get("hub.challenge"))
 
-    logger.warning(f"Webhook verification failed — token={token!r}")
-    return PlainTextResponse("Forbidden", status_code=403)
-
+    return "Verification failed"
 
 # ── Webhook receive (POST) ────────────────────────────────
 @app.post("/webhook")
@@ -73,17 +78,45 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         return PlainTextResponse("Bad Request", status_code=400)
 
     # Signature check (skipped if no APP_SECRET)
-    if _wa and not _wa.verify_signature(await request.body(), request.headers.get("X-Hub-Signature-256", "")):
+    if  verify_signature(await request.body(), request.headers.get("X-Hub-Signature-256", "")):
         return PlainTextResponse("Forbidden", status_code=403)
     phone=payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("from", "unknown")   
     message=payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("text", {}).get("body", "empty") 
 
     
-    response =chat(ChatRequest(phone=phone, message=message))
-    _wa.send_text(phone, response.get("response", "Désolé, une erreur est survenue."))
-     
+    response = await chat(ChatRequest(phone=phone, message=message))
+    await send_text(phone, response.get("response", "Désolé, une erreur est survenue."))     
 
-# ── Postman / test endpoint ───────────────────────────────
+
+def verify_signature(payload_bytes: bytes, signature: str) -> bool:
+    if not WHATSAPP_TOKEN:
+        return True
+    expected = "sha256=" + hmac.new(
+        key=WHATSAPP_TOKEN.encode("utf-8"),
+        msg=payload_bytes,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+async def send_text(to: str, text: str):
+    """Send a text message via WhatsApp Business API."""
+    if not WHATSAPP_TOKEN or not PHONE_ID:
+        return
+    url = f"{BASE_URL}/{PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text[:4096]},
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(url, json=payload, headers=headers)
+        except Exception:
+            pass
+
+
+
 class ChatRequest(BaseModel):
     phone: str
     message: str
